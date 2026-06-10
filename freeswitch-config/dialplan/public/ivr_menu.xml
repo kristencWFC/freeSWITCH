@@ -1,0 +1,14 @@
+<include>
+  <extension name="ivr_handler">
+    <condition field="destination_number" expression="^1122$">
+      <action application="socket" data="127.0.0.1:8084 sync full"/>
+    </condition>
+  </extension>
+
+  <extension name="ivr_return">
+    <condition field="destination_number" expression="^ivr_return$">
+      <action application="set" data="sip_bye_h_X-IVR-Result=${ivr_result}"/>
+      <action application="hangup" data="NORMAL_CLEARING"/>
+    </condition>
+  </extension>
+</include>

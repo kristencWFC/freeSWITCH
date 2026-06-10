@@ -1,0 +1,19 @@
+[Unit]
+Description=IVR Controller - FreeSWITCH ESL + Google STT
+After=network.target freeswitch.service
+Requires=freeswitch.service
+
+[Service]
+Type=simple
+User=kristenc
+Group=freeswitch
+WorkingDirectory=/opt/ivr-controller
+Environment=GOOGLE_APPLICATION_CREDENTIALS=/opt/ivr-controller/gcp-key.json
+ExecStart=/usr/bin/node /opt/ivr-controller/index.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

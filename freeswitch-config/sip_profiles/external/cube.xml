@@ -1,0 +1,9 @@
+<include>
+  <gateway name="cube">
+    <param name="username" value="freeswitch"/>
+    <param name="password" value="freeswitch123"/>
+    <param name="proxy" value="40.160.129.46"/>
+    <param name="register" value="true"/>
+    <param name="caller-id-in-from" value="true"/>
+  </gateway>
+</include>
