@@ -162,26 +162,22 @@ async function handleCall(conn) {
     } catch(e) { return null; }
   }
 
-  async function setResultAndHangup(result) {
+async function setResultAndHangup(result) {
     if (resultHandled) return;
     resultHandled = true;
+    const t0 = Date.now();
     console.log('Setting result:', result);
     stopSTT();
 
-    // Use inbound ESL for everything - outbound socket may be closed
     sendInboundCommand('uuid_record ' + uuid + ' stop ' + recFile).catch(() => {});
     const breakResult = await sendInboundCommand('uuid_break ' + uuid + ' all').catch(() => 'err');
-    console.log('Break result:', breakResult);
-
-    await new Promise(r => setTimeout(r, 200));
+    console.log('Break:', breakResult, '+', Date.now() - t0, 'ms');
 
     const setResult = await sendInboundCommand('uuid_setvar ' + uuid + ' sip_bye_h_X-IVR-Result ' + result).catch(() => 'err');
-    console.log('Setvar result:', setResult);
-
-    await new Promise(r => setTimeout(r, 200));
+    console.log('Setvar:', setResult, '+', Date.now() - t0, 'ms');
 
     const killResult = await sendInboundCommand('uuid_kill ' + uuid).catch(() => 'err');
-    console.log('Kill result:', killResult);
+    console.log('Kill:', killResult, '+', Date.now() - t0, 'ms');
 
     setTimeout(() => { try { fs.unlinkSync(recFile); } catch(e) {} }, 2000);
   }
