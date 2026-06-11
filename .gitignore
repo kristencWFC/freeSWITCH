@@ -2,3 +2,8 @@ node_modules/
 gcp-key.json
 *.wav
 *.log
+config.json
+gcp-key.json
+*.pre-refactor
+*.pre-elevenlabs
+*.v1backup
