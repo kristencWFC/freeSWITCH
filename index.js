@@ -19,11 +19,24 @@ const PROJECT_ID = 'memiccx';
 const RECOGNIZER = `projects/${PROJECT_ID}/locations/global/recognizers/_`;
 
 const wordToDigit = {
-  'one': '1', 'two': '2', 'three': '3', 'four': '4',
-  'five': '5', 'six': '6', 'seven': '7', 'nine': '9',
+  // Digit words
+  'one': '1', 'won': '1', 'juan': '1',
+  'two': '2', 'too': '2', 'to': '2',
+  'three': '3', 'tree': '3', 'free': '3',
+  'four': '4', 'for': '4', 'fore': '4',
+  'five': '5',
+  'six': '6', 'text': '6', 'sex': '6', 'fix': '6', 'sicks': '6',
+  'seven': '7',
+  'nine': '9', 'mine': '9', 'line': '9', 'none': '9',
   'repeat': '9', 'again': '9',
-  'operations': '1', 'maintenance': '2', 'safety': '3',
-  'fuel': '4', 'pay': '5', 'hr': '6', 'lumper': '7'
+  // Menu keywords
+  'operations': '1',
+  'maintenance': '2',
+  'safety': '3',
+  'fuel': '4',
+  'pay': '5',
+  'hr': '6', 'h r': '6', 'h. r.': '6', 'h.r.': '6',
+  'lumper': '7', 'lumber': '7'
 };
 
 function mapTranscriptToDigit(transcript) {
