@@ -182,10 +182,7 @@ function startSTTStream(onDigit) {
 
 async function handleCall(conn) {
   const uuid = conn.uuid();
-  let logPrefix = '[' + uuid.substring(0,8) + ']';
-  const log = (...args) => console.log(logPrefix, ...args);
-  const logErr = (...args) => console.error(logPrefix, ...args);
-  log('New call connected uuid:', uuid);
+  console.log('New call connected uuid:', uuid);
 
   const recFile = '/tmp/ivr_' + uuid + '.wav';
   let resultHandled = false;
@@ -214,18 +211,18 @@ async function setResultAndHangup(result) {
     if (resultHandled) return;
     resultHandled = true;
     const t0 = Date.now();
-    log('Setting result:', result);
+    console.log('Setting result:', result);
     stopSTT();
 
     sendInboundCommand('uuid_record ' + uuid + ' stop ' + recFile).catch(() => {});
     const breakResult = await sendInboundCommand('uuid_break ' + uuid + ' all').catch(() => 'err');
-    log('Break:', breakResult, '+', Date.now() - t0, 'ms');
+    console.log('Break:', breakResult, '+', Date.now() - t0, 'ms');
 
     const setResult = await sendInboundCommand('uuid_setvar ' + uuid + ' sip_bye_h_X-IVR-Result ' + result).catch(() => 'err');
-    log('Setvar:', setResult, '+', Date.now() - t0, 'ms');
+    console.log('Setvar:', setResult, '+', Date.now() - t0, 'ms');
 
     const killResult = await sendInboundCommand('uuid_kill ' + uuid).catch(() => 'err');
-    log('Kill:', killResult, '+', Date.now() - t0, 'ms');
+    console.log('Kill:', killResult, '+', Date.now() - t0, 'ms');
 
     setTimeout(() => { try { fs.unlinkSync(recFile); } catch(e) {} }, 2000);
   }
@@ -239,19 +236,13 @@ async function setResultAndHangup(result) {
     const menuVar = await conn.api('uuid_getvar ' + uuid + ' sip_h_X-IVR-Menu');
     const ivrMenu = (menuVar?.body || 'driver_line').toString().trim();
     const audioFile = path.join(SOUNDS_DIR, ivrMenu + '.wav');
-    log('IVR Menu:', ivrMenu);
+    console.log('IVR Menu:', ivrMenu);
 
     const customerIdVar = await conn.api('uuid_getvar ' + uuid + ' sip_h_X-Customer-ID');
     const customerId = (customerIdVar?.body || '').toString().trim();
     const callGuidVar = await conn.api('uuid_getvar ' + uuid + ' sip_h_X-Call-GUID');
     const callGuid = (callGuidVar?.body || '').toString().trim();
-    logPrefix = '[' + (callGuid || uuid.substring(0,8)) + ']';
-
-    const solutionVar = await conn.api('uuid_getvar ' + uuid + ' sip_h_X-Solution-Name');
-    const solutionName = (solutionVar?.body || '').toString().trim() || 'googlestt';
-
-    log('Solution:', solutionName);
-    log('Customer-ID:', customerId, '| Call-GUID:', callGuid);	
+    console.log('Customer-ID:', customerId, '| Call-GUID:', callGuid);	
 
     let attempts = 0;
     const maxAttempts = 3;
@@ -259,7 +250,7 @@ async function setResultAndHangup(result) {
     conn.on('DTMF', async (evt) => {
       if (resultHandled) return;
       const digit = evt?.body?.['DTMF-Digit'];
-      log('DTMF:', digit);
+      console.log('DTMF:', digit);
       if (digit && /^[1-79]$/.test(digit)) {
         if (digit === '9') {
           stopSTT();
@@ -280,7 +271,7 @@ async function setResultAndHangup(result) {
         await setResultAndHangup('0');
         return;
       }
-      log('Attempt:', attempts);
+      console.log('Attempt:', attempts);
 
       stopSTT();
       try { fs.unlinkSync(recFile); } catch(e) {}
@@ -288,7 +279,7 @@ async function setResultAndHangup(result) {
       // Use inbound ESL so a closed outbound socket can't crash us
       const setvarResult = await sendInboundCommand('uuid_setvar ' + uuid + ' RECORD_READ_ONLY true').catch(() => 'err');
       if (setvarResult === 'err' || (setvarResult && setvarResult.includes('ERR'))) {
-        log('Channel no longer exists, aborting attempt');
+        console.log('Channel no longer exists, aborting attempt');
         resultHandled = true;
         return;
       }
@@ -310,15 +301,15 @@ async function setResultAndHangup(result) {
           }
         });
         fileStreamer = streamFileToSTT(recFile, sttStream);
-        log('STT streaming started');
+        console.log('STT streaming started');
       }, 100);
 
       safeExecute('playback', audioFile, 60000);
-      log('Prompt playing...');
+      console.log('Prompt playing...');
 
       attemptTimeout = setTimeout(async () => {
         if (!resultHandled) {
-          log('Attempt', attempts, 'timeout');
+          console.log('Attempt', attempts, 'timeout');
           stopSTT();
           sendInboundCommand('uuid_record ' + uuid + ' stop ' + recFile).catch(() => {});
           sendInboundCommand('uuid_break ' + uuid + ' all').catch(() => {});
@@ -331,7 +322,7 @@ async function setResultAndHangup(result) {
     await runAttempt();
 
   } catch (err) {
-    logErr('Call error:', err.message);
+    console.error('Call error:', err.message);
     stopSTT();
     try {
       await safeExecute('set', 'sip_bye_h_X-IVR-Result=0');
