@@ -1,0 +1,12 @@
+{
+  "elevenlabs": {
+    "sipUser": "11Connect",
+    "sipPassword": "Cub3$$207888",
+    "sipHost": "sip.rtc.elevenlabs.io",
+    "sipNumber": "1117",
+    "transport": "tcp"
+  },
+  "webhook": {
+    "port": 8085
+  }
+}

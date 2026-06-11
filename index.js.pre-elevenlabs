@@ -1,6 +1,4 @@
 const esl = require('esl');
-const http = require('http');
-const config = require('./config.json');
 const speech = require('@google-cloud/speech');
 const fs = require('fs');
 const path = require('path');
@@ -253,23 +251,7 @@ async function setResultAndHangup(result) {
     const solutionName = (solutionVar?.body || '').toString().trim() || 'googlestt';
 
     log('Solution:', solutionName);
-    log('Customer-ID:', customerId, '| Call-GUID:', callGuid);
-
-    // Dispatch to ElevenLabs handler if requested
-    if (solutionName === 'elevenlabs') {
-      const elResult = await handleElevenLabs(conn, uuid, { log, logErr, callGuid, customerId });
-      const result = (elResult && elResult.result) || '0';
-      await sendInboundCommand('uuid_setvar ' + uuid + ' sip_bye_h_X-IVR-Result ' + result).catch(() => {});
-      for (const [n, v] of Object.entries((elResult && elResult.extraHeaders) || {})) {
-        if (v) await sendInboundCommand('uuid_setvar ' + uuid + ' sip_bye_h_' + n + ' ' + v).catch(() => {});
-      }
-      if (customerId) await sendInboundCommand('uuid_setvar ' + uuid + ' sip_bye_h_X-Customer-ID ' + customerId).catch(() => {});
-      if (callGuid) await sendInboundCommand('uuid_setvar ' + uuid + ' sip_bye_h_X-Call-GUID ' + callGuid).catch(() => {});
-      await new Promise(r => setTimeout(r, 200));
-      const killResult = await sendInboundCommand('uuid_kill ' + uuid).catch(() => 'err');
-      log('Kill:', killResult);
-      return;
-    }	
+    log('Customer-ID:', customerId, '| Call-GUID:', callGuid);	
 
     let attempts = 0;
     const maxAttempts = 3;
@@ -369,99 +351,3 @@ server.on('connection', (conn) => {
 server.listen({ port: ESL_PORT })
   .then(() => console.log('IVR Controller listening on port ' + ESL_PORT))
   .catch(console.error);
-
-// =====================================================
-// ElevenLabs handler + HTTP webhook listener
-// =====================================================
-const pendingWebhooks = new Map();
-
-const webhookServer = http.createServer((req, res) => {
-  if (req.method !== 'POST') {
-    res.writeHead(405); res.end('Method not allowed'); return;
-  }
-  let body = '';
-  req.on('data', chunk => { body += chunk; });
-  req.on('end', () => {
-    try {
-      const payload = JSON.parse(body);
-      const dv = (payload && payload.data && payload.data.conversation_initiation_client_data && payload.data.conversation_initiation_client_data.dynamic_variables) || {};
-      const callGuid = dv.sip_call_guid;
-      console.log('[webhook] received for call_guid:', callGuid || 'unknown');
-      if (callGuid && pendingWebhooks.has(callGuid)) {
-        const waiter = pendingWebhooks.get(callGuid);
-        pendingWebhooks.delete(callGuid);
-        clearTimeout(waiter.timeoutId);
-        waiter.resolve(payload);
-        console.log('[webhook] matched and resolved');
-      } else {
-        console.log('[webhook] no matching pending call');
-      }
-      res.writeHead(200); res.end('OK');
-    } catch (e) {
-      console.error('[webhook] parse error:', e.message);
-      res.writeHead(400); res.end('Bad payload');
-    }
-  });
-});
-
-webhookServer.listen(config.webhook.port, () => {
-  console.log('Webhook server listening on port ' + config.webhook.port);
-});
-
-async function handleElevenLabs(conn, uuid, ctx) {
-  const { log, logErr, callGuid, customerId } = ctx;
-  if (!callGuid) {
-    logErr('No X-Call-GUID, cannot correlate webhook');
-    return { result: '0', extraHeaders: { 'X-Error': 'no_call_guid' } };
-  }
-
-  const webhookPromise = new Promise((resolve) => {
-    const timeoutId = setTimeout(() => {
-      pendingWebhooks.delete(callGuid);
-      log('Webhook timeout after 5 min');
-      resolve(null);
-    }, 300000);
-    pendingWebhooks.set(callGuid, { resolve, timeoutId });
-  });
-
-  await sendInboundCommand('uuid_setvar ' + uuid + ' hangup_after_bridge false').catch(() => {});
-
-  const el = config.elevenlabs;
-  const bridgeVars = [
-    'sip_auth_username=' + el.sipUser,
-    'sip_auth_password=' + el.sipPassword,
-    'sip_h_X-Call-GUID=' + callGuid,
-    'sip_h_X-Customer-ID=' + customerId,
-  ].join(',');
-  const bridgeStr = '[' + bridgeVars + ']sofia/external/' + el.sipNumber + '@' + el.sipHost + ';transport=' + el.transport;
-  log('Bridging to ElevenLabs');
-
-  try {
-    await conn.execute('bridge', bridgeStr);
-  } catch (e) {
-    log('Bridge ended:', (e && e.message) || String(e));
-  }
-  log('Bridge complete, waiting for webhook...');
-
-  const webhookData = await webhookPromise;
-  if (!webhookData) {
-    return { result: '0', extraHeaders: { 'X-Error': 'webhook_timeout' } };
-  }
-
-  const data = webhookData.data || {};
-  const dc = (data.analysis && data.analysis.data_collection_results) || {};
-  const account = (dc.account && dc.account.value) || '';
-  const conversationId = data.conversation_id || '';
-  const terminationReason = (data.metadata && data.metadata.termination_reason) || '';
-  log('Account:', account, '| Termination:', terminationReason);
-
-  return {
-    result: account ? '1' : '0',
-    extraHeaders: {
-      'X-Account': account,
-      'X-EL-Conversation-ID': conversationId,
-      'X-Termination-Reason': terminationReason,
-    }
-  };
-}
-// =====================================================
