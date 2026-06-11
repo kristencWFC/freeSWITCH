@@ -193,6 +193,12 @@ async function setResultAndHangup(result) {
     const audioFile = path.join(SOUNDS_DIR, ivrMenu + '.wav');
     console.log('IVR Menu:', ivrMenu);
 
+    const customerIdVar = await conn.api('uuid_getvar ' + uuid + ' sip_h_X-Customer-ID');
+    const customerId = (customerIdVar?.body || '').toString().trim();
+    const callGuidVar = await conn.api('uuid_getvar ' + uuid + ' sip_h_X-Call-GUID');
+    const callGuid = (callGuidVar?.body || '').toString().trim();
+    console.log('Customer-ID:', customerId, '| Call-GUID:', callGuid);	
+
     let attempts = 0;
     const maxAttempts = 3;
 
