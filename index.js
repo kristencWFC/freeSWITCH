@@ -118,7 +118,7 @@ function streamFileToSTT(filePath, sttStream) {
   return { stop: () => clearInterval(interval) };
 }
 
-function startSTTStream(onDigit) {
+function startSTTStream(onDigit, log, logErr) {
   const stream = speechClient._streamingRecognize ? speechClient._streamingRecognize() : speechClient.streamingRecognize();
 
   // First message: config
@@ -161,22 +161,22 @@ function startSTTStream(onDigit) {
   });
 
   stream.on('data', (data) => {
-    console.log('STT raw event:', JSON.stringify(data).substring(0, 300));
+    log('STT raw event:', JSON.stringify(data).substring(0, 300));
     if (data.results && data.results[0]) {
       const transcript = data.results[0].alternatives[0].transcript;
       const isFinal = data.results[0].isFinal;
       if (transcript && transcript.trim().length > 0) {
-        console.log('STT ' + (isFinal ? 'FINAL' : 'interim') + ': ' + transcript);
+        log('STT ' + (isFinal ? 'FINAL' : 'interim') + ': ' + transcript);
         const digit = mapTranscriptToDigit(transcript);
         if (digit) {
-          console.log('Digit detected:', digit);
+          log('Digit detected:', digit);
           onDigit(digit);
         }
       }
     }
   });
 
-  stream.on('error', (err) => console.error('STT error:', err.message));
+  stream.on('error', (err) => logErr('STT error:', err.message));
   return stream;
 }
 
@@ -308,7 +308,7 @@ async function setResultAndHangup(result) {
           } else {
             await setResultAndHangup(digit);
           }
-        });
+        }, log, logErr);
         fileStreamer = streamFileToSTT(recFile, sttStream);
         log('STT streaming started');
       }, 100);
