@@ -13,10 +13,7 @@ const WAV_HEADER_SIZE = 44;
 const POLL_INTERVAL_MS = 10;
 
 process.env.GOOGLE_APPLICATION_CREDENTIALS = GOOGLE_CREDS;
-const speechV2 = require('@google-cloud/speech').v2;
-const speechClient = new speechV2.SpeechClient();
-const PROJECT_ID = 'memiccx';
-const RECOGNIZER = `projects/${PROJECT_ID}/locations/global/recognizers/_`;
+const speechClient = new speech.SpeechClient();
 
 const wordToDigit = {
   'one': '1', 'two': '2', 'three': '3', 'four': '4',
@@ -79,8 +76,6 @@ function sendInboundCommand(command) {
   });
 }
 
-const MAX_STT_CHUNK = 25000;  // V2 limit is 25600, leave headroom
-
 function streamFileToSTT(filePath, sttStream) {
   let position = WAV_HEADER_SIZE;
   const interval = setInterval(() => {
@@ -93,12 +88,7 @@ function streamFileToSTT(filePath, sttStream) {
         fs.readSync(fd, buffer, 0, length, position);
         fs.closeSync(fd);
         position += length;
-        // Split into chunks under the V2 limit
-        for (let off = 0; off < buffer.length; off += MAX_STT_CHUNK) {
-          if (sttStream.destroyed) break;
-          const chunk = buffer.slice(off, Math.min(off + MAX_STT_CHUNK, buffer.length));
-          sttStream.write({ audio: chunk });
-        }
+        if (!sttStream.destroyed) sttStream.write(buffer);
       }
     } catch(e) {}
   }, POLL_INTERVAL_MS);
@@ -106,49 +96,27 @@ function streamFileToSTT(filePath, sttStream) {
 }
 
 function startSTTStream(onDigit) {
-  const stream = speechClient._streamingRecognize ? speechClient._streamingRecognize() : speechClient.streamingRecognize();
-
-  // First message: config
-  stream.write({
-    recognizer: RECOGNIZER,
-    streamingConfig: {
-      config: {
-        explicitDecodingConfig: {
-          encoding: 'LINEAR16',
-          sampleRateHertz: 8000,
-          audioChannelCount: 1,
-        },
-        languageCodes: ['en-US'],
-        model: 'latest_short',
-        adaptation: {
-          phraseSets: [{
-            inlinePhraseSet: {
-              phrases: [
-                { value: 'one', boost: 20 }, { value: 'two', boost: 20 },
-                { value: 'three', boost: 20 }, { value: 'four', boost: 20 },
-                { value: 'five', boost: 20 }, { value: 'six', boost: 20 },
-                { value: 'seven', boost: 20 }, { value: 'nine', boost: 20 },
-                { value: 'operations', boost: 20 }, { value: 'maintenance', boost: 20 },
-                { value: 'safety', boost: 20 }, { value: 'fuel', boost: 20 },
-                { value: 'pay', boost: 20 }, { value: 'HR', boost: 20 },
-                { value: 'lumper', boost: 20 }, { value: 'repeat', boost: 20 }
-              ]
-            }
-          }]
-        }
-      },
-      streamingFeatures: {
-        interimResults: true,
-        enableVoiceActivityEvents: true,
-        voiceActivityTimeout: {
-          speechEndTimeout: { seconds: 0, nanos: 500000000 }
-        }
-      }
+  const stream = speechClient.streamingRecognize({
+    config: {
+      encoding: 'LINEAR16',
+      sampleRateHertz: 8000,
+      languageCode: 'en-US',
+      model: 'phone_call',
+      interimResults: true,
+      singleUtterance: true,
+      speechContexts: [{
+        phrases: [
+          'one', 'two', 'three', 'four', 'five',
+          'six', 'seven', 'nine', 'operations',
+          'maintenance', 'safety', 'fuel', 'pay',
+          'HR', 'lumper', 'repeat'
+        ],
+        boost: 20
+      }]
     }
   });
 
   stream.on('data', (data) => {
-    console.log('STT raw event:', JSON.stringify(data).substring(0, 300));
     if (data.results && data.results[0]) {
       const transcript = data.results[0].alternatives[0].transcript;
       const isFinal = data.results[0].isFinal;
@@ -263,15 +231,9 @@ async function setResultAndHangup(result) {
       stopSTT();
       try { fs.unlinkSync(recFile); } catch(e) {}
 
-      // Use inbound ESL so a closed outbound socket can't crash us
-      const setvarResult = await sendInboundCommand('uuid_setvar ' + uuid + ' RECORD_READ_ONLY true').catch(() => 'err');
-      if (setvarResult === 'err' || (setvarResult && setvarResult.includes('ERR'))) {
-        console.log('Channel no longer exists, aborting attempt');
-        resultHandled = true;
-        return;
-      }
-      const recResult = await sendInboundCommand('uuid_record ' + uuid + ' start ' + recFile).catch(() => 'err');
-      console.log('Record:', recResult);
+      await conn.api('uuid_setvar ' + uuid + ' RECORD_READ_ONLY true');
+      const recResult = await conn.api('uuid_record ' + uuid + ' start ' + recFile);
+      console.log('Record:', recResult?.body?.toString().trim());
 
       setTimeout(() => {
         if (resultHandled) return;
