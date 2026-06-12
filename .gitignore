@@ -7,3 +7,4 @@ gcp-key.json
 *.pre-refactor
 *.pre-elevenlabs
 *.v1backup
+README.md
