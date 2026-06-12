@@ -487,6 +487,9 @@ server.listen({ port: ESL_PORT })
 // ElevenLabs handler + HTTP webhook listener
 // =====================================================
 const pendingWebhooks = new Map();
+// Secondary signal: when the post-call webhook arrives (whether or not the tool already fired),
+// any tool-path waiter listens for this as a "bridge truly ended" signal.
+const postCallEndSignals = new Map();
 
 
 function verifyElevenLabsSignature(rawBody, signatureHeader, secret) {
@@ -515,6 +518,17 @@ function verifyElevenLabsSignature(rawBody, signatureHeader, secret) {
   }
 }
 
+// Both the post-call webhook and the in-call tool resolve the same pendingWebhooks waiter.
+// Normalized payload shape: { source, data: {key:value}, terminationReason, conversationId }
+function resolveWaiter(callGuid, normalized) {
+  if (!callGuid || !pendingWebhooks.has(callGuid)) return false;
+  const waiter = pendingWebhooks.get(callGuid);
+  pendingWebhooks.delete(callGuid);
+  clearTimeout(waiter.timeoutId);
+  waiter.resolve(normalized);
+  return true;
+}
+
 const webhookServer = http.createServer((req, res) => {
   if (req.method !== 'POST') {
     res.writeHead(405); res.end('Method not allowed'); return;
@@ -522,6 +536,62 @@ const webhookServer = http.createServer((req, res) => {
   let body = '';
   req.on('data', chunk => { body += chunk; });
   req.on('end', () => {
+
+    // -------------------------------------------------------------------------
+    // /agent-tool/submit - generic in-call tool endpoint.
+    // The agent calls this BEFORE end_call to push collected data immediately.
+    // Body: { call_guid: "uuid", data: { key: value, ... } }
+    // Auth: X-Tool-Auth header matched against config.agentTool.authSecret
+    // -------------------------------------------------------------------------
+    if (req.url === '/agent-tool/submit') {
+      const expectedAuth = (config.agentTool && config.agentTool.authSecret) || null;
+      if (!expectedAuth) {
+        console.error('[agent-tool] No authSecret configured');
+        res.writeHead(500); res.end(JSON.stringify({ error: 'server_not_configured' })); return;
+      }
+      const provided = req.headers['x-tool-auth'];
+      if (!provided || provided !== expectedAuth) {
+        console.error('[agent-tool] Invalid or missing X-Tool-Auth header');
+        res.writeHead(401); res.end(JSON.stringify({ error: 'auth_failed' })); return;
+      }
+      let payload;
+      try { payload = JSON.parse(body); }
+      catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'invalid_json' })); return; }
+
+      const callGuid = payload.call_guid;
+      const data = (payload.data && typeof payload.data === 'object') ? payload.data : {};
+      if (!callGuid || typeof callGuid !== 'string') {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'missing_call_guid' })); return;
+      }
+
+      // Coerce values to strings so they can ride as SIP headers
+      const cleanData = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (v == null) continue;
+        cleanData[String(k)] = String(v);
+      }
+
+      const normalized = {
+        source: 'tool',
+        data: cleanData,
+        terminationReason: 'tool_submitted',
+        conversationId: '',
+      };
+      console.log('[agent-tool] received for call_guid:', callGuid, '| keys:', Object.keys(cleanData).join(',') || '(none)');
+      if (resolveWaiter(callGuid, normalized)) {
+        console.log('[agent-tool] matched and resolved');
+        res.writeHead(200); res.end(JSON.stringify({ status: 'ok', received: Object.keys(cleanData).length }));
+      } else {
+        console.log('[agent-tool] no matching pending call');
+        res.writeHead(404); res.end(JSON.stringify({ error: 'no_matching_call' }));
+      }
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Default: post-call webhook from ElevenLabs (fallback path).
+    // Normalized to the same shape as the tool endpoint.
+    // -------------------------------------------------------------------------
     const secret = (config.elevenlabs && config.elevenlabs.webhookSecret) || null;
     if (secret) {
       const sig = req.headers['elevenlabs-signature'];
@@ -534,15 +604,31 @@ const webhookServer = http.createServer((req, res) => {
       const payload = JSON.parse(body);
       const dv = (payload && payload.data && payload.data.conversation_initiation_client_data && payload.data.conversation_initiation_client_data.dynamic_variables) || {};
       const callGuid = dv.sip_call_guid;
-console.log('[webhook] received for call_guid:', callGuid || 'unknown');
-      if (callGuid && pendingWebhooks.has(callGuid)) {
-        const waiter = pendingWebhooks.get(callGuid);
-        pendingWebhooks.delete(callGuid);
-        clearTimeout(waiter.timeoutId);
-        waiter.resolve(payload);
+      console.log('[webhook] received for call_guid:', callGuid || 'unknown');
+
+      // Flatten data_collection_results into a plain key -> value map
+      const dc = (payload.data && payload.data.analysis && payload.data.analysis.data_collection_results) || {};
+      const cleanData = {};
+      for (const [k, valueObj] of Object.entries(dc)) {
+        if (valueObj && valueObj.value != null) cleanData[String(k)] = String(valueObj.value);
+      }
+      const normalized = {
+        source: 'post_call_webhook',
+        data: cleanData,
+        terminationReason: (payload.data && payload.data.metadata && payload.data.metadata.termination_reason) || '',
+        conversationId: (payload.data && payload.data.conversation_id) || '',
+      };
+      if (resolveWaiter(callGuid, normalized)) {
         console.log('[webhook] matched and resolved');
       } else {
-        console.log('[webhook] no matching pending call');
+        console.log('[webhook] no matching pending call (may have been resolved by tool earlier)');
+      }
+      // Always fire the post-call end signal - any tool-path waiter on this callGuid will exit
+      if (callGuid && postCallEndSignals.has(callGuid)) {
+        const resolver = postCallEndSignals.get(callGuid);
+        postCallEndSignals.delete(callGuid);
+        resolver();
+        console.log('[webhook] signaled post-call end to tool-path waiter');
       }
       res.writeHead(200); res.end('OK');
     } catch (e) {
@@ -664,30 +750,87 @@ async function handleElevenLabs(conn, uuid, ctx) {
 
   const webhookData = await webhookPromise;
 
-  // Webhook arrived - stop the bridge-end poll if it's still running, then stop hold music
+  if (!webhookData) {
+    clearInterval(bridgeEndCheck);
+    if (holdMusicPlaying) sendInboundCommand('uuid_break ' + uuid + ' all').catch(() => {});
+    return { result: '0', extraHeaders: { 'X-Error': 'webhook_timeout' } };
+  }
+
+  const source = webhookData.source || 'unknown';
+  log('Data received from:', source);
+
+  // After the tool fires we have the data but the bridge is still alive. Wait for the
+  // bridge to truly end via a 3-way race so we minimize dead air:
+  //   (a) B-leg disappears (uuid_exists -> false) - ideal, fires within a second of SIP BYE
+  //   (b) Post-call webhook arrives - means ElevenLabs has fully processed the call
+  //   (c) Hard 15s timeout - escape hatch when ElevenLabs's SIP timer keeps the leg open
+  // On (c) we forcibly kill the B-leg so the A-leg can tear down promptly.
+  if (source === 'tool' && blegUuid) {
+    log('Tool resolved during active bridge - waiting up to 15s for bridge to end...');
+    clearInterval(bridgeEndCheck); // Stop the hold-music poll - agent's voice fills the gap
+    const waitStart = Date.now();
+    const maxWaitMs = 15000;
+
+    const postCallPromise = new Promise(resolve => {
+      postCallEndSignals.set(callGuid, resolve);
+    });
+
+    let hitTimeout = false;
+    await new Promise((resolve) => {
+      let done = false;
+      let blegInterval = null;
+      const finish = (reason) => {
+        if (done) return;
+        done = true;
+        log('Bridge-end wait done: ' + reason + ' (' + (Date.now() - waitStart) + 'ms)');
+        if (blegInterval) clearInterval(blegInterval);
+        postCallEndSignals.delete(callGuid);
+        resolve();
+      };
+      blegInterval = setInterval(async () => {
+        if (done) return;
+        const existsResp = await sendInboundCommand('uuid_exists ' + blegUuid).catch(() => '');
+        if (existsResp.trim().toLowerCase() === 'false') finish('B-leg disconnected');
+      }, 300);
+      postCallPromise.then(() => finish('Post-call webhook arrived'));
+      setTimeout(() => { hitTimeout = true; finish('Hard timeout reached'); }, maxWaitMs);
+    });
+
+    if (hitTimeout) {
+      log('Force-killing lingering B-leg: ' + blegUuid);
+      sendInboundCommand('uuid_kill ' + blegUuid).catch(() => {});
+    }
+  }
+
+  // Tear down ancillary timers and stop any hold music that was playing
   clearInterval(bridgeEndCheck);
   if (holdMusicPlaying) {
     sendInboundCommand('uuid_break ' + uuid + ' all').catch(() => {});
     log('Hold music stopped');
   }
-  if (!webhookData) {
-    return { result: '0', extraHeaders: { 'X-Error': 'webhook_timeout' } };
-  }
 
+  // Build BYE headers from the generic data dictionary.
+  // snake_case keys become Pascal-Dashed: account_number -> X-IVR-Account-Number
   const data = webhookData.data || {};
-  const dc = (data.analysis && data.analysis.data_collection_results) || {};
-  const account = (dc.account && dc.account.value) || '';
-  const conversationId = data.conversation_id || '';
-  const terminationReason = (data.metadata && data.metadata.termination_reason) || '';
-  log('Account:', account, '| Termination:', terminationReason);
+  const account = data.account || '';
+  const terminationReason = webhookData.terminationReason || '';
+  const conversationId = webhookData.conversationId || '';
+  log('Source:', source, '| Termination:', terminationReason, '| Data:', JSON.stringify(data));
+
+  const extraHeaders = {
+    'X-EL-Conversation-ID': conversationId,
+    'X-Termination-Reason': terminationReason,
+  };
+  for (const [key, value] of Object.entries(data)) {
+    const headerKey = 'X-IVR-' + key.split(/[_-]+/).map(s => s ? s[0].toUpperCase() + s.slice(1) : '').join('-');
+    extraHeaders[headerKey] = String(value);
+  }
+  // Backward-compat: keep the legacy X-Account header populated when data.account is present
+  if (account) extraHeaders['X-Account'] = account;
 
   return {
     result: account ? '1' : '0',
-    extraHeaders: {
-      'X-Account': account,
-      'X-EL-Conversation-ID': conversationId,
-      'X-Termination-Reason': terminationReason,
-    }
+    extraHeaders,
   };
 }
 // =====================================================
