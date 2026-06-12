@@ -598,9 +598,78 @@ async function handleElevenLabs(conn, uuid, ctx) {
       logErr('Bridge error:', msg);
     }
   }
+  log('Waiting for bridge to actually end before starting hold music...');
+
+  // The ESL command timeout doesn't mean the bridge ended - it just means the library
+  // gave up waiting for the command-reply. CHANNEL_UNBRIDGE events are queued behind
+  // the active bridge app, so we can't listen for them on the outbound socket.
+  // Solution: poll via inbound ESL for bridge_hangup_cause, which FreeSWITCH sets when
+  // the bridge truly ends. Then start hold music while we wait for the post-call webhook.
+  const holdMusicFile = '/usr/share/freeswitch/sounds/ivr/onholdmusic.wav';
+  let holdMusicPlaying = false;
+  let bridgeEnded = false;
+
+  // bridge_uuid on the A-leg never clears (FreeSWITCH preserves it). Different approach:
+  // first capture the B-leg UUID from bridge_uuid, then poll uuid_exists on that B-leg.
+  // When ElevenLabs disconnects, the B-leg ceases to exist in FreeSWITCH - that's our signal.
+  let pollCount = 0;
+  let blegUuid = null;
+  const bridgeEndCheck = setInterval(async () => {
+    if (bridgeEnded) {
+      clearInterval(bridgeEndCheck);
+      return;
+    }
+    pollCount++;
+
+    // Phase 1: capture the B-leg UUID once
+    if (!blegUuid) {
+      const bUuid = await sendInboundCommand('uuid_getvar ' + uuid + ' bridge_uuid').catch(() => '');
+      if (bUuid && !bUuid.includes('_undef_') && !bUuid.includes('-ERR') && bUuid.trim() !== '') {
+        blegUuid = bUuid.trim();
+        log('Captured B-leg UUID: ' + blegUuid + ' - polling for its existence');
+      }
+      return;
+    }
+
+    // Phase 2: poll for B-leg existence
+    const exists = await sendInboundCommand('uuid_exists ' + blegUuid).catch(() => 'err');
+    const existsStr = exists.trim().toLowerCase();
+
+    if (pollCount === 1 || pollCount % 4 === 0) {
+      log('[BLEG-POLL #' + pollCount + '] bleg=' + blegUuid + ' exists=' + existsStr);
+    }
+
+    if (existsStr === 'false' || existsStr.includes('false') || existsStr.includes('-err')) {
+      // B-leg is gone - ElevenLabs has disconnected
+      bridgeEnded = true;
+      clearInterval(bridgeEndCheck);
+      log('B-leg has disconnected - starting hold music');
+      sendInboundCommand('uuid_broadcast ' + uuid + ' endless_playback::' + holdMusicFile + ' aleg')
+        .then((r) => {
+          if (r && !String(r).includes('ERR')) {
+            holdMusicPlaying = true;
+            log('Hold music started');
+          } else {
+            log('Hold music did not start:', r);
+          }
+        })
+        .catch(() => {});
+    }
+  }, 500);
+
+  // Safety: stop polling after 30 minutes max so we don't leak the interval
+  setTimeout(() => clearInterval(bridgeEndCheck), 30 * 60 * 1000);
+
   log('Waiting for ElevenLabs webhook...');
 
   const webhookData = await webhookPromise;
+
+  // Webhook arrived - stop the bridge-end poll if it's still running, then stop hold music
+  clearInterval(bridgeEndCheck);
+  if (holdMusicPlaying) {
+    sendInboundCommand('uuid_break ' + uuid + ' all').catch(() => {});
+    log('Hold music stopped');
+  }
   if (!webhookData) {
     return { result: '0', extraHeaders: { 'X-Error': 'webhook_timeout' } };
   }
