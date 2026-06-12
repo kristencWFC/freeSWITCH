@@ -1,5 +1,6 @@
 const esl = require('esl');
 const http = require('http');
+const crypto = require('crypto');
 const config = require('./config.json');
 const speech = require('@google-cloud/speech');
 const fs = require('fs');
@@ -375,6 +376,33 @@ server.listen({ port: ESL_PORT })
 // =====================================================
 const pendingWebhooks = new Map();
 
+
+function verifyElevenLabsSignature(rawBody, signatureHeader, secret) {
+  if (!signatureHeader || !secret) return false;
+  const parts = signatureHeader.split(',');
+  let timestamp = null;
+  let signature = null;
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith('t=')) timestamp = trimmed.substring(2);
+    if (trimmed.startsWith('v0=')) signature = trimmed.substring(3);
+  }
+  if (!timestamp || !signature) return false;
+  // Reject timestamps older than 5 minutes (replay protection)
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - parseInt(timestamp, 10)) > 300) {
+    console.error('[webhook] Signature timestamp out of range:', timestamp);
+    return false;
+  }
+  const payload = timestamp + '.' + rawBody;
+  const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'));
+  } catch (e) {
+    return false;
+  }
+}
+
 const webhookServer = http.createServer((req, res) => {
   if (req.method !== 'POST') {
     res.writeHead(405); res.end('Method not allowed'); return;
@@ -382,11 +410,19 @@ const webhookServer = http.createServer((req, res) => {
   let body = '';
   req.on('data', chunk => { body += chunk; });
   req.on('end', () => {
+    const secret = (config.elevenlabs && config.elevenlabs.webhookSecret) || null;
+    if (secret) {
+      const sig = req.headers['elevenlabs-signature'];
+      if (!verifyElevenLabsSignature(body, sig, secret)) {
+        console.error('[webhook] Invalid or missing signature, rejecting');
+        res.writeHead(401); res.end('Unauthorized'); return;
+      }
+    }
     try {
       const payload = JSON.parse(body);
       const dv = (payload && payload.data && payload.data.conversation_initiation_client_data && payload.data.conversation_initiation_client_data.dynamic_variables) || {};
       const callGuid = dv.sip_call_guid;
-      console.log('[webhook] received for call_guid:', callGuid || 'unknown');
+console.log('[webhook] received for call_guid:', callGuid || 'unknown');
       if (callGuid && pendingWebhooks.has(callGuid)) {
         const waiter = pendingWebhooks.get(callGuid);
         pendingWebhooks.delete(callGuid);
@@ -438,10 +474,19 @@ async function handleElevenLabs(conn, uuid, ctx) {
 
   try {
     await conn.execute('bridge', bridgeStr);
+    log('Bridge call completed');
   } catch (e) {
-    log('Bridge ended:', (e && e.message) || String(e));
+    const msg = (e && e.message) || String(e);
+    // ESL library has a 10s command-reply timeout. Long calls trigger this
+    // but the bridge itself continues in FreeSWITCH; webhook arrival is the
+    // real end-of-call signal.
+    if (msg.indexOf('FreeSwitchTimeout') >= 0 || msg.indexOf('Timeout after') >= 0) {
+      log('Bridge call in progress (ESL command timeout is expected for long calls)');
+    } else {
+      logErr('Bridge error:', msg);
+    }
   }
-  log('Bridge complete, waiting for webhook...');
+  log('Waiting for ElevenLabs webhook...');
 
   const webhookData = await webhookPromise;
   if (!webhookData) {
