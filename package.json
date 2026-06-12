@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@deepgram/sdk": "^4.11.3",
     "@google-cloud/speech": "^7.3.2",
     "esl": "^11.2.1"
   }

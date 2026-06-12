@@ -3,6 +3,7 @@ const http = require('http');
 const crypto = require('crypto');
 const config = require('./config.json');
 const speech = require('@google-cloud/speech');
+const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
@@ -119,6 +120,96 @@ function streamFileToSTT(filePath, sttStream) {
     } catch(e) {}
   }, POLL_INTERVAL_MS);
   return { stop: () => clearInterval(interval) };
+}
+
+function startDeepgramStream(onDigit, log, logErr) {
+  const dgConfig = (typeof config !== 'undefined' && config && config.deepgram) || {};
+  const apiKey = dgConfig.apiKey;
+  if (!apiKey) {
+    logErr('Deepgram: no apiKey in config.json (config.deepgram.apiKey)');
+    return { write: () => {}, destroy: () => {}, get destroyed() { return true; } };
+  }
+
+  const dg = createClient(apiKey);
+  const live = dg.listen.live({
+    model: dgConfig.model || 'nova-3',
+    language: 'en-US',
+    encoding: 'linear16',
+    sample_rate: 8000,
+    channels: 1,
+    interim_results: true,
+    endpointing: dgConfig.endpointing || 300,
+    smart_format: false,
+    punctuate: false,
+    keyterm: [
+      'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'nine',
+      'operations', 'maintenance', 'safety', 'fuel', 'pay', 'HR', 'lumper', 'repeat'
+    ],
+  });
+
+  let ready = false;
+  let _destroyed = false;
+  let _chunkCount = 0;
+  const pendingChunks = [];
+
+  live.on(LiveTranscriptionEvents.Open, () => {
+    log('Deepgram stream open (model=' + (dgConfig.model || 'nova-3') + ')');
+    ready = true;
+    while (pendingChunks.length > 0) {
+      const chunk = pendingChunks.shift();
+      try { live.send(chunk); } catch (e) {}
+    }
+  });
+
+  live.on(LiveTranscriptionEvents.Transcript, (data) => {
+    try {
+      const alt = data && data.channel && data.channel.alternatives && data.channel.alternatives[0];
+      const transcript = alt && alt.transcript;
+      if (!transcript || !transcript.trim()) return;
+      const isFinal = !!data.is_final;
+      log('Deepgram ' + (isFinal ? 'FINAL' : 'interim') + ': ' + transcript);
+      const digit = mapTranscriptToDigit(transcript);
+      if (digit) {
+        log('Digit detected:', digit);
+        onDigit(digit);
+      }
+    } catch (e) { logErr('Deepgram transcript handler error:', e.message); }
+  });
+
+  live.on(LiveTranscriptionEvents.Error, (err) => {
+    logErr('Deepgram error:', (err && err.message) || String(err));
+  });
+
+  live.on(LiveTranscriptionEvents.Close, () => {
+    log('Deepgram stream closed');
+    ready = false;
+  });
+
+  return {
+    write(chunk) {
+      if (_destroyed) return;
+      // Unwrap Google STT v2 envelope ({audio: Buffer}) - Deepgram wants raw audio bytes
+      let buf = chunk;
+      if (chunk && typeof chunk === 'object' && !Buffer.isBuffer(chunk) && chunk.audio) {
+        buf = chunk.audio;
+      }
+      if (!Buffer.isBuffer(buf) && !(buf instanceof Uint8Array)) return;
+      _chunkCount++;
+      if (_chunkCount === 1 || _chunkCount % 50 === 0) {
+        log('Deepgram: sent ' + _chunkCount + ' chunks (last=' + buf.length + ' bytes)');
+      }
+      if (ready) {
+        try { live.send(buf); } catch (e) {}
+      } else {
+        pendingChunks.push(buf);
+      }
+    },
+    destroy() {
+      _destroyed = true;
+      try { live.finish(); } catch (e) {}
+    },
+    get destroyed() { return _destroyed; },
+  };
 }
 
 function startSTTStream(onDigit, log, logErr) {
@@ -272,12 +363,19 @@ async function setResultAndHangup(result) {
       return;
     }	
 
+    // STT engine selector - 'deepgram' or default ('googlestt')
+    const sttFactory = (solutionName === 'deepgram') ? startDeepgramStream : startSTTStream;
+    log('STT engine:', (solutionName === 'deepgram') ? 'deepgram (Nova-3)' : 'googlestt (latest_short)');
+
     let attempts = 0;
     const maxAttempts = 3;
 
-    conn.on('DTMF', async (evt) => {
+    conn.on('esl::event::DTMF::*', async (evt) => {
       if (resultHandled) return;
-      const digit = evt?.body?.['DTMF-Digit'];
+      // body holds the FreeSWITCH event headers across library versions
+      const digit = (evt && evt.body && evt.body['DTMF-Digit'])
+                 || (evt && typeof evt.getHeader === 'function' && evt.getHeader('DTMF-Digit'))
+                 || null;
       log('DTMF:', digit);
       if (digit && /^[1-79]$/.test(digit)) {
         if (digit === '9') {
@@ -316,7 +414,7 @@ async function setResultAndHangup(result) {
 
       setTimeout(() => {
         if (resultHandled) return;
-        sttStream = startSTTStream(async (digit) => {
+        sttStream = sttFactory(async (digit) => {
           if (resultHandled) return;
           if (digit === '9') {
             stopSTT();
