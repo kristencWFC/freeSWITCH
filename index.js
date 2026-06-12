@@ -276,6 +276,19 @@ function startSTTStream(onDigit, log, logErr) {
 
 async function handleCall(conn) {
   const uuid = conn.uuid();
+  // TEMPORARY DEBUG: log every event emitted on this connection
+  const _origEmit = conn.emit.bind(conn);
+  conn.emit = function(name, ...args) {
+    if (typeof name === 'string'
+        && !name.startsWith('socket.')
+        && !name.startsWith('freeswitch_command_reply')
+        && !name.startsWith('CHANNEL_EXECUTE_COMPLETE')
+        && name !== 'data') {
+      const digitMaybe = args[0]?.body?.['DTMF-Digit'];
+      console.log('[EMIT]', name, digitMaybe ? '(digit=' + digitMaybe + ')' : '');
+    }
+    return _origEmit(name, ...args);
+  };
   let logPrefix = '[' + uuid.substring(0,8) + ']';
   const log = (...args) => console.log(logPrefix, ...args);
   const logErr = (...args) => console.error(logPrefix, ...args);
@@ -370,12 +383,9 @@ async function setResultAndHangup(result) {
     let attempts = 0;
     const maxAttempts = 3;
 
-    conn.on('esl::event::DTMF::*', async (evt) => {
+    conn.on('DTMF', async (evt) => {
       if (resultHandled) return;
-      // body holds the FreeSWITCH event headers across library versions
-      const digit = (evt && evt.body && evt.body['DTMF-Digit'])
-                 || (evt && typeof evt.getHeader === 'function' && evt.getHeader('DTMF-Digit'))
-                 || null;
+      const digit = evt?.body?.['DTMF-Digit'];
       log('DTMF:', digit);
       if (digit && /^[1-79]$/.test(digit)) {
         if (digit === '9') {
@@ -430,6 +440,9 @@ async function setResultAndHangup(result) {
         log('STT streaming started');
       }, 100);
 
+      // playback_terminators must be set before playback so DTMF interrupts the prompt
+      // and the DTMF event fires in real time (instead of being queued until playback ends).
+      sendInboundCommand('uuid_setvar ' + uuid + ' playback_terminators 1234567890').catch(() => {});
       safeExecute('playback', audioFile, 60000);
       log('Prompt playing...');
 
@@ -439,6 +452,7 @@ async function setResultAndHangup(result) {
           stopSTT();
           sendInboundCommand('uuid_record ' + uuid + ' stop ' + recFile).catch(() => {});
           sendInboundCommand('uuid_break ' + uuid + ' all').catch(() => {});
+          sendInboundCommand('uuid_setvar ' + uuid + ' playback_terminators 1234567890').catch(() => {});
           await safeExecute('playback', SOUNDS_DIR + '/timeout.wav', 10000);
           runAttempt();
         }
